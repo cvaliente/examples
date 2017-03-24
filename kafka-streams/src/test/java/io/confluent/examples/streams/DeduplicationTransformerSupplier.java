@@ -1,6 +1,4 @@
-
 package io.confluent.examples.streams;
-
 
 import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serdes;
@@ -11,31 +9,30 @@ import org.apache.kafka.streams.kstream.Transformer;
 import org.apache.kafka.streams.kstream.TransformerSupplier;
 import org.apache.kafka.streams.processor.ProcessorContext;
 import org.apache.kafka.streams.processor.StateStoreSupplier;
-import org.apache.kafka.streams.state.KeyValueIterator;
-import org.apache.kafka.streams.state.KeyValueStore;
 import org.apache.kafka.streams.state.Stores;
+import org.apache.kafka.streams.state.WindowStoreIterator;
+import org.apache.kafka.streams.state.internals.RocksDBWindowStore;
 
-import java.util.concurrent.TimeUnit;
 
 /**
  * Created by cvaliente on 24.03.17.
- *
+ * <p>
  * de-duplicates a stream by ids returned by a uidExtractor over a window of maintainDurationMs
  */
 
 
-public class DeduplicationTransformerSupplier<K, V, T> implements TransformerSupplier<K, V, KeyValue<K,V>> {
+public class DeduplicationTransformerSupplier<K, V, T> implements TransformerSupplier<K, V, KeyValue<K, V>> {
 
     private final String storeName;
     private final long maintainDurationMs;
-    private long flushInterval;
-    private final KeyValueMapper<K,V,T> uidExtractor;
+    private final KeyValueMapper<K, V, T> uidExtractor;
 
     public DeduplicationTransformerSupplier(KStreamBuilder builder,
                                             String storeName,
-                                            KeyValueMapper<K,V,T> uidExtractor,
+                                            KeyValueMapper<K, V, T> uidExtractor,
                                             Serde<T> uidSerde,
-                                            long maintainDurationMs) {
+                                            long maintainDurationMs,
+                                            int segments) {
         this.storeName = storeName;
         this.uidExtractor = uidExtractor;
         this.maintainDurationMs = maintainDurationMs;
@@ -43,37 +40,33 @@ public class DeduplicationTransformerSupplier<K, V, T> implements TransformerSup
                 .withKeys(uidSerde)
                 .withValues(Serdes.Long())
                 .persistent()
+                .windowed(maintainDurationMs, segments, false)
                 .build();
         builder.addStateStore(deduplicationStoreSupplier, storeName);
-        this.flushInterval = TimeUnit.MINUTES.toMillis(1);
     }
 
-    public void setFlushInterval(long flushInterval) {
-        this.flushInterval = flushInterval;
-    }
 
     @Override
-    public Transformer<K, V, KeyValue<K,V>> get() {
+    public Transformer<K, V, KeyValue<K, V>> get() {
         return new DeduplicationTransformer();
     }
 
-    private class DeduplicationTransformer implements Transformer<K, V, KeyValue<K,V>> {
+    private class DeduplicationTransformer implements Transformer<K, V, KeyValue<K, V>> {
 
-        private KeyValueStore<T, Long> store;
+        private RocksDBWindowStore<T, Long> store;
         private ProcessorContext context;
+
 
         @SuppressWarnings("unchecked")
         @Override
         public void init(ProcessorContext context) {
             this.context = context;
 
-            store = (KeyValueStore<T, Long>) context.getStateStore(storeName);
-
-            this.context.schedule(flushInterval);
+            store = (RocksDBWindowStore<T, Long>) context.getStateStore(storeName);
         }
 
         @Override
-        public KeyValue<K,V> transform(final K key,final  V value) {
+        public KeyValue<K, V> transform(final K key, final V value) {
 
             T uid = uidExtractor.apply(key, value);
 
@@ -81,44 +74,23 @@ public class DeduplicationTransformerSupplier<K, V, T> implements TransformerSup
             if (uid == null)
                 return KeyValue.pair(key, value);
 
-            Long uidTime = store.get(uid);
+            WindowStoreIterator<Long> timeIterator = store.fetch(uid, context.timestamp() - maintainDurationMs,
+                    context.timestamp() + maintainDurationMs);
+            store.put(uid, context.timestamp());
 
-            // update entry to timestamp of latest entry
-            store.put(uid, uidTime == null || uidTime < context.timestamp() ? context.timestamp() : uidTime);
-
-            if (uidTime == null || hasExpired(uidTime)) {
+            if (timeIterator.hasNext()) {
+                timeIterator.close();
+                return null;
+            } else {
+                timeIterator.close();
                 return KeyValue.pair(key, value);
             }
-            else {
-                return null;
-            }
         }
-
 
         @Override
-        public KeyValue<K,V> punctuate(final long timestamp) {
-
-            // delete uIDs that haven't been seen for maintainDurationMs ms
-            purgeExpiredEventIds();
+        public KeyValue<K, V> punctuate(final long timestamp) {
+            // our windowStore segments are closed automatically
             return null;
-        }
-
-        private void purgeExpiredEventIds() {
-            try (final KeyValueIterator<T, Long> iterator = store.all()) {
-                while (iterator.hasNext()) {
-                    final KeyValue<T, Long> entry = iterator.next();
-                    final long eventTimestamp = entry.value;
-                    if (hasExpired(eventTimestamp)) {
-                        store.delete(entry.key);
-                    }
-                }
-            }
-        }
-
-
-        private boolean hasExpired(final long eventTimestamp) {
-            final long nowMs = context.timestamp();
-            return (nowMs - eventTimestamp) > maintainDurationMs;
         }
 
         @Override
