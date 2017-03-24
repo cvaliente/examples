@@ -1,4 +1,5 @@
-package com.trivago.streams.transform;
+
+package io.confluent.examples.streams;
 
 
 import org.apache.kafka.common.serialization.Serde;
