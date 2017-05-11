@@ -149,7 +149,7 @@ public class EventDeduplicationLambdaIntegrationTest {
       timeIterator.close();
 
       // add new event or update existing event with new timestamp (to prevent expiry)
-      eventIdStore.put(eventId, context.timestamp(), context.timestamp());
+      eventIdStore.put(eventId, eventTime, eventTime);
 
       return isDuplicate;
     }
