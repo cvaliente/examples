@@ -30,9 +30,7 @@ import org.apache.kafka.streams.kstream.KeyValueMapper;
 import org.apache.kafka.streams.kstream.Transformer;
 import org.apache.kafka.streams.processor.ProcessorContext;
 import org.apache.kafka.streams.processor.StateStoreSupplier;
-import org.apache.kafka.streams.state.KeyValueIterator;
-import org.apache.kafka.streams.state.KeyValueStore;
-import org.apache.kafka.streams.state.Stores;
+import org.apache.kafka.streams.state.*;
 import org.apache.kafka.test.TestUtils;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
@@ -105,7 +103,7 @@ public class EventDeduplicationLambdaIntegrationTest {
      * Value: timestamp (event-time) of the corresponding event when the event ID was seen for the
      * first time
      */
-    private KeyValueStore<E, Long> eventIdStore;
+    private WindowStore<E, Long> eventIdStore;
 
     /**
      * How long to remember an event ID.  Event IDs that have been stored for longer than this
@@ -128,55 +126,39 @@ public class EventDeduplicationLambdaIntegrationTest {
     @SuppressWarnings("unchecked")
     public void init(final ProcessorContext context) {
       this.context = context;
-      eventIdStore = (KeyValueStore<E, Long>) context.getStateStore("eventId-store");
-      this.context.schedule(TimeUnit.MINUTES.toMillis(1));
+      eventIdStore = (WindowStore<E, Long>) context.getStateStore("eventId-store");
     }
 
     @Override
-    public KeyValue<K, V> transform(final K recordKey, final V recordValue) {
-      final E eventId = idExtractor.apply(recordKey, recordValue);
-      if (eventId != null) {
-        if (isDuplicate(eventId)) {
-          // Discard the record.
-          return null;
-        } else {
-          remember(eventId, context.timestamp());
-          // Forward the record downstream as-is.
-          return KeyValue.pair(recordKey, recordValue);
-        }
-      }
-      // Forward the record downstream as-is.
-      return KeyValue.pair(recordKey, recordValue);
+    public KeyValue<K, V> transform(final K key, final V value) {
+
+      E uid = idExtractor.apply(key, value);
+
+      // if the idExtractor returns null, always forward -- allows skipping of this check for certain records
+      if (uid == null)
+        return KeyValue.pair(key, value);
+
+      return isDuplicate(uid)? null: KeyValue.pair(key, value);
     }
+
 
     private boolean isDuplicate(final E eventId) {
-      return eventIdStore.get(eventId) != null;
+      Long eventTime = context.timestamp();
+      WindowStoreIterator<Long> timeIterator = eventIdStore.fetch(eventId, eventTime - maintainDurationMs,eventTime + maintainDurationMs);
+      boolean isDuplicate = timeIterator.hasNext();
+      timeIterator.close();
+
+      // add new event or update existing event with new timestamp (to prevent expiry)
+      eventIdStore.put(eventId, context.timestamp(), context.timestamp());
+
+      return isDuplicate;
     }
 
-    private void remember(final E eventId, final long eventTimestamp) {
-      eventIdStore.put(eventId, eventTimestamp);
-    }
 
     @Override
-    public KeyValue<K, V> punctuate(final long currentStreamTimeMs) {
-      purgeExpiredEventIds(currentStreamTimeMs);
+    public KeyValue<K, V> punctuate(final long timestamp) {
+      // our windowStore segments are closed automatically
       return null;
-    }
-
-    private void purgeExpiredEventIds(final long currentStreamTimeMs) {
-      try (final KeyValueIterator<E, Long> iterator = eventIdStore.all()) {
-        while (iterator.hasNext()) {
-          final KeyValue<E, Long> entry = iterator.next();
-          final long eventTimestamp = entry.value;
-          if (hasExpired(eventTimestamp, currentStreamTimeMs)) {
-            eventIdStore.delete(entry.key);
-          }
-        }
-      }
-    }
-
-    private boolean hasExpired(final long eventTimestamp, final long currentStreamTimeMs) {
-      return (currentStreamTimeMs - eventTimestamp) > maintainDurationMs;
     }
 
     @Override
@@ -216,6 +198,7 @@ public class EventDeduplicationLambdaIntegrationTest {
         .withKeys(Serdes.String()) // must match the return type of the Transformer's id extractor
         .withValues(Serdes.Long())
         .persistent()
+        .windowed(TimeUnit.MINUTES.toMillis(10), TimeUnit.MINUTES.toMillis(30), 3, false)
         .build();
 
     builder.addStateStore(deduplicationStoreSupplier);
